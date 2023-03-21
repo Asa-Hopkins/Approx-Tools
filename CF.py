@@ -1,9 +1,5 @@
 import numpy as np
 import scipy
-from mpmath import mp
-mp.dps = 50
-precision = np.float128
-cprecision = np.complex256
 
 def CF(fz, m, n, nfft, K):
 # CF -- COMPLEX RATIONAL CF APPROXIMATION ON THE UNIT INTERVAL
