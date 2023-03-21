@@ -1,7 +1,7 @@
 import numpy as np
 import scipy
 
-def CF(fz, m, n, nfft, K):
+def CF(fz, m, n, nfft = 128, K = 20):
 # CF -- COMPLEX RATIONAL CF APPROXIMATION ON THE UNIT INTERVAL
 #
 # Lloyd N. Trefethen, Dept. of Math., M.I.T., March 1986
@@ -57,7 +57,7 @@ def CF(fz, m, n, nfft, K):
 # RESULTS
     return pc, qc, s
 
-def RCF(fz, m, n, nfft, K):
+def RCF(fz, m, n, nfft = 128, K = 20):
 # RCF -- REAL RATIONAL CF APPROXIMATION ON THE UNIT INTERVAL
 #
 # Lloyd N. Trefethen, Dept. of Math., M.I.T., March 1986
@@ -84,7 +84,6 @@ def RCF(fz, m, n, nfft, K):
     z = np.exp(2*np.pi*1j*np.arange(0,nfft)/nfft)
     x = np.real(z)
     f = fz(x)
-    print(f)
     fc = np.real(np.fft.fft(f))/nfft2#
 #
 # SVD OF HANKEL MATRIX H
