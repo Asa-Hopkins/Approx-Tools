@@ -118,9 +118,9 @@ def RCF(fz, m, n, nfft = 128, K = 20):
     gam = np.real(np.fft.fft(1/Q)/nfft2)
     gam = scipy.linalg.toeplitz(gam[:2*m+1])
     if m==0:
-        Pc = np.linalg.solve(gam,2*rtc[0]);
+        Pc = 2*rtc[0]/gam
     else:
-        Pc = np.linalg.solve(gam,2*np.concatenate([rtc[m:0:-1],rtc[0:m+1]]));
+        Pc = np.linalg.solve(gam,2*np.concatenate([rtc[m:0:-1],rtc[0:m+1]]))
 
     Pc = Pc[m1:2*m+1]
     Pc[0] /= 2
