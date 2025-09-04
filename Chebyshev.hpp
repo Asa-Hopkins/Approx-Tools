@@ -49,7 +49,7 @@ public:
   // Subtraction
   Chebyshev operator-(const Chebyshev &q) const {
     return *this + (-q);
-  }
+  }  
 
   // Evaluate at a single point using Clenshaw algorithm
   Scalar eval(Scalar x) const {
@@ -74,7 +74,7 @@ public:
   }
 
   // Evaluate on a vector of points
-  // Very naive way for now
+  // Naive way for now
   Vector eval(const Vector &xs) const {
     Vector ys(xs.size());
     for (int i = 0; i < xs.size(); ++i) {
@@ -108,27 +108,46 @@ public:
 
   // FFT-based fit specialized for f: [-1,1] -> R functions
   // See "Study of algorithmic properties of chebyshev coefficients" by Ahmed and Fisher, equation 6
-  // Computes Chebyshev expansion of f(x) on [-1,1]
+  // Computes Chebyshev expansion (by default, option for interpolant) of f(x) on [-1,1] to order n
+
+  // It's actually better (more accurate and more consistent timings) to calculate to a higher degree than requested and truncate
+  // See chapter 4 of Approximation Theory and Approximation Practice (By Trefethen) for intro on aliasing issues and truncation
+  // Theorem 16.1 says that going to higher n and truncating has a Lebesque constant that's reduced by factor pi/2
+
   template <typename Func>
-  static Chebyshev fit(Func f, unsigned int n) {
+  static Chebyshev fit(Func f, unsigned int n, bool truncate = true) {
     if (n == 0) {
       Vector zero(1);
       zero << Scalar(0);
       return Chebyshev(zero);
     }
 
+    int m = n;
+
+    //Taken from "Bit Twiddling Hacks" by Sean Eron Anderson
+    //rounds m to the next power of 2 greater or equal to it
+    if (truncate){
+      m--;
+      m |= m >> 1;
+      m |= m >> 2;
+      m |= m >> 4;
+      m |= m >> 8;
+      m |= m >> 16;
+      m++;
+    }
+
     const Scalar pi = std::acos(Scalar(-1));
     const Complex I(Scalar(0), Scalar(1));
     Eigen::FFT<Scalar> fft;
 
-    // Buffers of length 2n
-    std::vector<Complex> vals(2*n, Complex(0,0));
-    std::vector<Complex> fft_out(2*n);
+    // Buffers for FFT input and output
+    std::vector<Complex> vals(2*m, Complex(0,0));
+    std::vector<Complex> fft_out(2*m);
 
     // Build array of f(cos(theta_k)) values
     // We use 0-based indexing compared to reference
-    for (unsigned int i = 0; i < n; ++i) {
-      Scalar theta = (Scalar(2*i + 1) * pi) / (Scalar(2)*n);
+    for (unsigned int i = 0; i < m; ++i) {
+      Scalar theta = (Scalar(2*i + 1) * pi) / (Scalar(2)*m);
       Scalar x = std::cos(theta);
       vals[i] = Complex(f(x), Scalar(0));
     }
@@ -136,12 +155,12 @@ public:
     // Inverse FFT
     fft.inv(fft_out, vals);
 
-    // Scale by 4*exp(i*pi*k/(2n)) and trim to first n
-    // iFFT divides by the length N = 2n, so the 2/n factor
+    // Scale by 4*exp(i*pi*k/(2n)) and truncate to first n
+    // iFFT divides by the length N = 2m, so the 2/m factor
     // in the reference becomes 4 for us
     Vector coeffs(n);
     for (unsigned int k = 0; k < n; ++k) {
-      Scalar angle = (pi * Scalar(k)) / (Scalar(2) * n);
+      Scalar angle = (pi * Scalar(k)) / (Scalar(2) * m);
       Complex mult = std::exp(I * angle) * Scalar(4);
       Complex val = fft_out[k] * mult;
       coeffs[k] = val.real();
@@ -209,37 +228,36 @@ public:
       } else {
         Qk << c/h, -s/h,
               std::conj(s)/h, std::conj(c)/h;
-     }
-     rotations[k-1] = Qk;
+      }
+      rotations[k-1] = Qk;
 
-     if (k != 1) {
-       g[k-2] = Qk(0,0)*g[k-2] - Qk(0,1)*q2[k]*std::conj(p[k-2]);
-     }
+      if (k != 1) {
+        g[k-2] = Qk(0,0)*g[k-2] - Qk(0,1)*q2[k]*std::conj(p[k-2]);
+      }
 
-     auto temp = Qk(0,0)*d[k-1] + Qk(0,1)*g[k-1];
-     g[k-1] = Qk(1,0)*d[k-1] + Qk(1,1)*g[k-1];
-     d[k-1] = temp;
+      auto temp = Qk(0,0)*d[k-1] + Qk(0,1)*g[k-1];
+      g[k-1] = Qk(1,0)*d[k-1] + Qk(1,1)*g[k-1];
+      d[k-1] = temp;
 
-     temp = Qk(0,0)*b[k-1] + Qk(0,1)*d[k];
-     d[k] = Qk(1,0)*b[k-1] + Qk(1,1)*d[k];
-     b[k-1] = temp;
+      temp = Qk(0,0)*b[k-1] + Qk(0,1)*d[k];
+      d[k] = Qk(1,0)*b[k-1] + Qk(1,1)*d[k];
+      b[k-1] = temp;
+ 
+      temp = Qk(0,0)*p[k-1] + Qk(0,1)*p[k];
+      p[k] = Qk(1,0)*p[k-1] + Qk(1,1)*p[k];
+      p[k-1] = temp;
+      if (std::norm(p[k-1]*std::conj(q[k])) +
+      std::norm(p[k]*std::conj(q[k])) >
+      std::norm(b[k-1]) + std::norm(d[k])) {
+        p[k-1] = -b[k-1]/std::conj(q[k]);
+      }
 
-     temp = Qk(0,0)*p[k-1] + Qk(0,1)*p[k];
-     p[k] = Qk(1,0)*p[k-1] + Qk(1,1)*p[k];
-     p[k-1] = temp;
+      temp = Qk(0,0)*q2[k-1] + Qk(0,1)*q2[k];
+      q2[k] = Qk(1,0)*q2[k-1] + Qk(1,1)*q2[k];
+      q2[k-1] = temp;
+    } 
 
-     if (std::norm(p[k-1]*std::conj(q[k])) +
-     std::norm(p[k]*std::conj(q[k])) >
-     std::norm(b[k-1]) + std::norm(d[k])) {
-       p[k-1] = -b[k-1]/std::conj(q[k]);
-     }
-
-     temp = Qk(0,0)*q2[k-1] + Qk(0,1)*q2[k];
-     q2[k] = Qk(1,0)*q2[k-1] + Qk(1,1)*q2[k];
-     q2[k-1] = temp;
-     }
-
-     return;
+    return;
   }
 
   // ================= Algorithm 4: Shifted QR iteration =================
@@ -312,4 +330,89 @@ public:
     );
 
   }
+
+  //Uses the method from "Real Polynomial Chebyshev Approximation by the Carathéodory-Fejér Method"
+  //By Gutknecht and Trefethen (1982)
+
+  //The algorithm in the above paper is simpler than their 1983 one which covers rational approximation
+  template <typename Func>
+  static Chebyshev RCF(Func f, unsigned int n, unsigned int N) {
+  //inputs: f is a function to be approximated on [-1,1]
+  //n is the returned polynomial degree
+  //N is the polynomial degree for calculations, the error of fit(f,N) should be negligible compared to fit(f,n)
+
+  //Basic idea is to form a Hankel matrix from an extended Chebyshev series of the function
+  //Then the largest eigenvalue estimates the approximation error and the eigenvector describes
+  //a rational function for the error, called b(x)
+  //We use the knowledge of that error to correct the Chebyshev series of order n
+
+  //Some notes on optimisation
+  //The 1983 paper suggests multiple places where FFTs could be applied but I haven't implemented it yet
+  //They refer to "FAST FOURIER METHODS IN COMPUTATIONAL COMPLEX ANALYSIS" by Peter Henrici (1979)
+
+  //The laurent series for the Blaskche product b(x) can be calculated via FFT, since it's the ratio
+  //of two polynomials in the monomial basis, and multiplication/division is pointwise in fourier space.
+
+  //Forming the polynomial q(x) which is p(x) but with the zeros inside the unit disc factored out
+  //can be done with an FFT method too, see section 3.2 of Peter's book
+  //The algorithm there seems to give p(x)/q(x) and I haven't figured out a way to get q(x) directly
+
+  //Something they don't mention is that mutliplication by a Hankel matrix can be done with an FFT too
+  //This would make the fastest way to get the largest eigenvalue/vector a Lanczos iteration using these FFTs
+  //I've implemented this in Python but not C++ yet, it is really fast even for small n
+
+  //I don't bother with any of that yet. For smooth cases, N - n will be small so just using direct methods is fine.
+  
+    using Eigen::seq;
+    using Eigen::last;
+
+    if (n == 0) {
+      Vector zero(1);
+      zero << Scalar(0);
+      return Chebyshev(zero);
+    }
+
+    auto c = Chebyshev::fit(f, N+1);
+
+    // construct Hankel matrix of size (N-n) x (N-n)
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> H = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>::Zero(N - n, N - n);
+
+    for (int i = 0; i < N-n; i++){
+      H(i,Eigen::seq(0,last - i)) = c.coeffs(seq(i+n+1,last));
+    }
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>> es(H);
+    auto evals = es.eigenvalues();            // Should be ascending order but we do a full search anyway
+    auto evecs = es.eigenvectors();           // columns are eigenvectors
+
+    //We want argmax of abs(evals)
+    Eigen::Index idx;
+    (evals.array().abs()).maxCoeff(&idx);
+
+    Scalar val = evals(idx);
+    Eigen::VectorX<Scalar> u = evecs.col(idx).transpose();
+
+    //Let v(z) be the polynomial with u[1:]/u[0] as its coefficients
+    //We want the Laurent series (outside unit disc) of val * z^N * v(z)/v(z*)
+    //Only need coefficients b_k for orders -n to n
+
+    //We essentially use the long division algorithm to get this iterative formula
+    //b_k given by c_k for n+1 <= k <= N
+    //Then the others are given by b_k = -1/u_1 ( b_{k+1} * u_2 + b_{k+1} * u_3 + ... + b_{k+M-m-1} * u_{M-m))
+    Vector b = Vector::Zero(n + N + 1);
+    
+    b(seq(2*n + 1, last)) = c.coeffs(seq(n + 1, last));
+    
+    for (int k = n; k + n + 1 > 0; k--){
+      int i = k + n;
+      b[i] = -1/u[0] * b(seq(i+1,i+N-n-1)).dot(u(seq(1,last)));
+      c.coeffs[abs(k)] -= b[i];
+    }
+    
+    c.coeffs.conservativeResize(n+1);
+    c.degree = n;
+
+    return c;
+  }
+
 };
