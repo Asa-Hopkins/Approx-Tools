@@ -347,27 +347,25 @@ public:
     Eigen::FFT<Scalar> fft;
 
     // Buffers for FFT input and output
-    std::vector<Complex> vals(2*m, Complex(0,0));
-    std::vector<Complex> fft_out(2*m);
+    Vector vals(2*m);
+    vals.setZero();
+    VectorC fft_out(2*m);
 
     // Build array of f(cos(theta_k)) values
     // We use 0-based indexing compared to reference
     for (unsigned int i = 0; i < m; ++i) {
-      Scalar theta = (Scalar(2*i + 1) * pi) / (Scalar(2)*m);
+      Scalar theta = (Scalar(2*i + 1) * pi) / Scalar(2*m);
       Scalar x = std::cos(theta);
-      vals[i] = Complex(f(x), Scalar(0));
+      vals[i] = f(x);
     }
-
     // Inverse FFT
-    fft.inv(fft_out, vals);
+    fft.fwd(fft_out, vals);
 
-    // Scale by 4*exp(i*pi*k/(2n)) and truncate to first n
-    // iFFT divides by the length N = 2m, so the 2/m factor
-    // in the reference becomes 4 for us
+    // Scale by 2*exp(i*pi*k/(2n))/m and truncate to first n
     Vector coeffs(n);
     for (unsigned int k = 0; k < n; ++k) {
-      Scalar angle = (pi * Scalar(k)) / (Scalar(2) * m);
-      Complex mult = std::exp(I * angle) * Scalar(4);
+      Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
+      Complex mult = std::exp(-I * angle) * Scalar(2) / Scalar(m);
       Complex val = fft_out[k] * mult;
       coeffs[k] = val.real();
     }
@@ -375,11 +373,6 @@ public:
     coeffs[0] /= Scalar(2);
     return Chebyshev(coeffs);
   }
-  
-  //Fit polynomial at arbitrary nodes
-  //O(n^2) method - set up Lagrange interpolant, evaluate at Chebyshev nodes
-  //then call the FFT fit above. 
-
 
   //Finds roots of Chebyshev series polynomial
   //Constructs the "colleague matrix" which has our polynomial as its characteristic polynomial
