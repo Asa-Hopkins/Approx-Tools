@@ -1,10 +1,17 @@
 #pragma once
+
+#ifdef use_otfft
+#include <otfftpp/otfft.h>
+#endif
+
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/FFT>
-#include <Spectra/SymEigsSolver.h>
+
 #include <vector>
 #include <complex>
 #include <cmath>
+#include <iostream>
+#include <algorithm>
 
 int next_power(int n){
   int m = n;
@@ -20,6 +27,28 @@ int next_power(int n){
   return m;
 }
 
+#ifdef use_otfft
+#ifdef fft_cache
+#include <unordered_map>
+#include <memory>
+OTFFT::RealDCT& get_thread_local_dct(size_t n) {
+  thread_local std::unordered_map<size_t, std::unique_ptr<OTFFT::RealDCT>> cache;
+
+  auto it = cache.find(n);
+  if (it != cache.end()){return *it->second;}
+
+  // Create and cache a new DCT plan
+  auto dct = OTFFT::createDCT(n);
+  auto& ref = *dct;
+  cache.emplace(n, std::move(dct));
+  return ref;
+}
+#endif
+#endif
+
+//Spectra provides sparse matrix methods, but slows down compilation a lot
+#ifdef use_spectra
+#include <Spectra/SymEigsSolver.h>
 template <typename Scalar_>
 class HankelOp
 {
@@ -75,7 +104,6 @@ public:
 
         // Pointwise multiply in freq domain
         temp.array() *= circle.array();
-//        ComplexVec Yf = circle.array() * Xf.array();
 
         // Inverse FFT: ytime = ifft(Yf)
         fft.inv(output, temp);
@@ -84,7 +112,7 @@ public:
         Eigen::Map<Vector>(y_out, n) = output.head(n).real().reverse().eval();
     }
 };
-
+#endif
 
 template<typename Scalar = double>
 class Chebyshev {
@@ -96,6 +124,7 @@ public:
 
   Vector coeffs;
   int degree;
+  Scalar error;
 
   // Constructor
   Chebyshev() : coeffs(Vector::Zero(1)), degree(0) {}
@@ -183,7 +212,6 @@ public:
     //When the two polynomials have different lengths we need to be careful
     //since the original version only works for equal lengths. We can treat
     //the shorter polynomial as having 0s up to the length of the larger one.
-
     
     //g(da-1+i) terms
     for (int i = 1; da - 1 + i < g.size(); ++i) {
@@ -273,11 +301,15 @@ public:
     return Chebyshev(new_coeffs);
   }
 
-  static Chebyshev from_roots(VectorC roots){
+  static Chebyshev from_roots(VectorC roots, Scalar tol = 1e-15){
     //We only support real valued polynomials
     //So we assume all complex roots appear with their conjugate
     //therefore we directly form the quadratic with both roots when we encounter the one with imag(root)>0
-    int i = 0;
+
+    int n = roots.size();
+    //Divide and conquer
+    if (n > 6){return from_roots(roots.head(n/2), tol)*from_roots(roots.tail(n - n/2), tol);}
+
     Vector temp(1);
     temp << 1;
     Chebyshev out = Chebyshev(temp);
@@ -286,7 +318,7 @@ public:
     Vector quadratic(3);
 
     for (auto& c: roots){
-      if (abs(imag(c)) > abs(real(c))*1e-15){
+      if (abs(imag(c)) > abs(real(c))*tol){
         if (imag(c) > 0){
           //If the root is c = a+ib, then in monomial basis the quadratic is x^2 - 2ax + a^2 + b^2
           //This is [a^2+b^2+0.5, -2a, 0.5] in Chebyshev basis
@@ -298,14 +330,7 @@ public:
         linear << -real(c) , 1;
         out = out*Chebyshev(linear);
       }
-     i++;
-     //The values have a tendency to blow up. We renormalise every few iterations to try keeping them in a reasonable range
-     if (i == 25){
-       out.coeffs /= out.coeffs.cwiseAbs().maxCoeff();
-       i = 0;
-     }
     }
-    if (i > 5){out.coeffs /= out.coeffs.cwiseAbs().maxCoeff();}
     return out;
   }
 
@@ -321,14 +346,93 @@ public:
     coeffs.conservativeResize(last+1);
   } 
 
-  // FFT-based fit specialized for f: [-1,1] -> R functions
-  // See "Study of algorithmic properties of chebyshev coefficients" by Ahmed and Fisher, equation 6
-  // Computes Chebyshev expansion (by default, option for interpolant) of f(x) on [-1,1] to order n
+  // FFT-based Chebyshev fit for f: [-1,1] -> R functions
+  // Computes Chebyshev expansion (interpolant if truncate = false) of f(x) on [-1,1] to order n
 
   // It's actually better (more accurate and more consistent timings) to calculate to a higher degree than requested and truncate
   // See chapter 4 of Approximation Theory and Approximation Practice (By Trefethen) for intro on aliasing issues and truncation
   // Theorem 16.1 says that going to higher n and truncating has a Lebesque constant that's reduced by factor pi/2
 
+  //This function uses a method described by Makhoul in "A Fast Cosine Transform in One and Two Dimensions"
+  //To calculate a DCT using an FFT without needing to pad the array with zeros.
+  //Very simple python implementations can be found in the link below
+  //https://dsp.stackexchange.com/questions/2807/fast-cosine-transform-via-fft
+
+  //If OTFFT is available then we just use their DCT implementation directly
+  #ifdef use_otfft
+  static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n) {
+    if (n == 0) return Chebyshev();
+
+    //Make sure there's some extra elements for error estimate
+    unsigned int m = n + 10;
+
+    //Could replace this with smarter choice of smooth numbers
+    m = next_power(m);
+    unsigned int extra = m - n;
+
+    Vector vals(m);
+
+    //We need to sample f(x) the Chebyshev nodes, cos((2*i + 1) * pi / 2 / m)
+    //The FFT is so fast that this is a significant part of runtime even for huge n
+    //So we use the angle addition formulae to save on calls to std::cos
+    const Scalar pi = std::acos(Scalar(-1));
+    const Scalar delta = pi / m;
+    const Scalar c0 = std::cos(delta);
+    const Scalar s0 = std::sin(delta);
+
+    Scalar c = std::cos(pi / (2*m));
+    Scalar s = std::sin(pi / (2*m));
+
+    for (unsigned int i = 0; i < m; ++i) {
+        Scalar x = c;
+        vals[i] = f(x);
+
+        // update using recurrence
+        const Scalar c_next = c * c0 - s * s0;
+        const Scalar s_next = s * c0 + c * s0;
+        c = c_next;
+        s = s_next;
+
+        // correct every 16 iterations to mitigate drift in precision
+        if ((i & 15) == 0) {
+            Scalar theta = (Scalar(2*(i + 1) + 1) * pi) / Scalar(2*m);
+            c = std::cos(theta);
+            s = std::sin(theta);
+        }
+    }
+
+    OTFFT::double_vector cv = vals.data();
+
+    #ifdef fft_cache
+    auto& fft = get_thread_local_dct(m);
+    fft.fwdn(cv);
+    #else
+    auto fft = OTFFT::createDCT(m);
+    fft->fwdn(cv);
+    #endif
+
+    vals *= 2;
+    vals[0] /= Scalar(2);
+
+    Chebyshev output = Chebyshev(vals.head(n));
+    //Estimate error from extra components
+
+    output.error = vals.tail(extra).cwiseAbs().sum();
+
+    //Estimate decay rate as median of ratios between elements
+    //This doesn't work as intended currently
+    /*
+    Vector decays = vals.segment(n-1, extra-1).array() / vals.segment(n, extra - 1).array();
+
+    std::nth_element(decays.data(), decays.data() + (extra - 1) / 2, decays.data() + (extra - 1));
+
+    Scalar rho = decays[(extra - 1)/2];
+
+    output.error /= Scalar(1) - rho;
+    */
+    return output;
+  }
+  #else
   static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n, bool truncate = true) {
     if (n == 0) {
       Vector zero(1);
@@ -344,28 +448,29 @@ public:
 
     const Scalar pi = std::acos(Scalar(-1));
     const Complex I(Scalar(0), Scalar(1));
+    
     Eigen::FFT<Scalar> fft;
 
     // Buffers for FFT input and output
-    Vector vals(2*m);
-    vals.setZero();
-    VectorC fft_out(2*m);
+    Vector vals(m);
+    VectorC fft_out(m);
 
-    // Build array of f(cos(theta_k)) values
-    // We use 0-based indexing compared to reference
-    for (unsigned int i = 0; i < m; ++i) {
-      Scalar theta = (Scalar(2*i + 1) * pi) / Scalar(2*m);
-      Scalar x = std::cos(theta);
-      vals[i] = f(x);
+    // Build array of f(cos(theta_k)) values, but shuffled a bit
+    // Normally theta_k = (2*k + 1)*pi/2/m
+    for (unsigned int i = 0; i < m; i++) {
+      int k = 4*i + 1;
+      if (k > 2*m) k = 4*m - k;
+      Scalar theta = (Scalar(k) * pi) / Scalar(2*m);
+      vals[i] = f(std::cos(theta));
     }
-    // Inverse FFT
+
     fft.fwd(fft_out, vals);
 
     // Scale by 2*exp(i*pi*k/(2n))/m and truncate to first n
     Vector coeffs(n);
     for (unsigned int k = 0; k < n; ++k) {
       Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
-      Complex mult = std::exp(-I * angle) * Scalar(2) / Scalar(m);
+      Complex mult = std::exp(-I * angle) * (Scalar(2) / m);
       Complex val = fft_out[k] * mult;
       coeffs[k] = val.real();
     }
@@ -373,6 +478,12 @@ public:
     coeffs[0] /= Scalar(2);
     return Chebyshev(coeffs);
   }
+  #endif
+  
+  //Fit polynomial at arbitrary nodes
+  //O(n^2) method - set up Lagrange interpolant, evaluate at Chebyshev nodes
+  //then call the FFT fit above. 
+
 
   //Finds roots of Chebyshev series polynomial
   //Constructs the "colleague matrix" which has our polynomial as its characteristic polynomial
@@ -512,6 +623,12 @@ public:
     int d = degree;
     if (d <= 0) return VectorC();
 
+    if (d == 1){
+      VectorC root(1);
+      root << -coeffs[0]/coeffs[1];
+      return root;
+    }
+
     // nth unit vector
     Vector e_n = Vector::Zero(d);
     e_n[d-1] = 1;
@@ -568,7 +685,9 @@ public:
   //This would make the fastest way to get the largest eigenvalue/vector a Lanczos iteration using these FFTs
   //I have implemented this with Spectra
     using Eigen::seq;
-    using Eigen::last;
+
+    //Eigen 3 complains this is deprecated but Eigen 5 removes the suggested alternative
+    using Eigen::placeholders::last;
 
     if (n == 0) {
       Vector zero(1);
@@ -576,12 +695,14 @@ public:
       return Chebyshev(zero);
     }
 
-    auto c = Chebyshev::fit(f, N+1);
+    Chebyshev c = Chebyshev::fit(f, N+1);
 
     Vector u = Vector::Zero(N-n);
 
     //Crossover for dense solver vs sparse solver
+    #ifdef use_spectra
     if ((N - n) < 90){
+    #endif
       // construct Hankel matrix of size (N-n) x (N-n)
       Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> H = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>::Zero(N - n, N - n);
 
@@ -600,18 +721,19 @@ public:
 
       Scalar val = evals(idx);
       u = evecs.col(idx).transpose();
+      c.error += abs(val);
+    #ifdef use_spectra
     }
     else{
       //Pass in first row of H
       HankelOp<Scalar> op(c.coeffs(seq(n+1,last)));
       Spectra::SymEigsSolver<HankelOp<Scalar>> eigs(op, 1, 20);
-      //Spectra::DenseSymMatProd<Scalar> op(H);
-      //Spectra::SymEigsSolver<Spectra::DenseSymMatProd<Scalar>> eigs(op, 1, 10);
       eigs.init();
       int nconv = eigs.compute(Spectra::SortRule::LargestMagn);
       auto evecs = eigs.eigenvectors();
       u = evecs.col(0).transpose();
     }
+    #endif
 
     //Let v(z) be the polynomial with u[1:]/u[0] as its coefficients
     //We want the Laurent series (outside unit disc) of val * z^N * v(z)/v(z*)
@@ -621,14 +743,15 @@ public:
     //b_k = c_k for n+1 <= k <= N
     //Then the others are given by b_k = -1/u_1 ( b_{k+1} * u_2 + b_{k+1} * u_3 + ... + b_{k+M-m-1} * u_{M-m))
     Vector b = Vector::Zero(n + N + 1);
-    
+
     b(seq(2*n + 1, last)) = c.coeffs(seq(n + 1, last));
-    
+
     for (int k = n; k + n + 1 > 0; k--){
       int i = k + n;
+
       b[i] = -1/u[0] * b(seq(i+1,i+N-n-1)).dot(u(seq(1,last)));
 
-      //Correct the Chebyshev series
+      //Correct the Chebyshev series with laurent series
       c.coeffs[abs(k)] -= b[i];
     }
     

@@ -20,7 +20,7 @@ struct Remez{
     // Compute barycentric weights
     Vector w(n);
     for (int j = 0; j < n; ++j) {
-        //1/prod blows up so we double every value as a preconditioner.
+        // 1/prod blows up so we double every value as a preconditioner.
         //I'm unsure why 2 works, the geometric average spacing of Chebyshev nodes is pi/n
         Vector diff = 2*(xi[j] - xi);
         diff[j] = 1.0;  // avoid zero for self-subtraction
@@ -69,10 +69,8 @@ struct Remez{
 
     if (roots_in > 0){
       //These roots must exist in the output
-      Poly forced_roots = Poly::from_roots(sorted_roots.head(roots_in));
-
-      Poly new_weight = Poly::from_roots(sorted_roots.tail(weight.degree - roots_in));
-      
+      Poly forced_roots = Poly::from_roots(sorted_roots.head(roots_in), 1);
+      Poly new_weight = Poly::from_roots(sorted_roots.tail(weight.degree - roots_in), n*1e-15);
       Poly new_remez = Remez::SimpleRemez([&](Scalar a) -> Scalar {return f(a)/forced_roots(a); }, n - roots_in, N, new_weight);
       return new_remez*forced_roots;
     }
@@ -96,19 +94,33 @@ struct Remez{
       Poly error = (f_c - p2)*w_i;
       //The roots function divides by error.coeffs[-1] so we make sure there's no trailing zeros
       error.trunc();
+
       VectorC extrema = error.deriv().roots();
 
+      //We use std::sort to sort with respect to real part
+      struct
+      {
+          bool operator()(Complex a, Complex b) const { return real(a) < real(b); }
+      }
+      realLess;
+
+      std::sort(extrema.data(), extrema.data() + extrema.size(), realLess);
 
       int j = 1;
+      Scalar old_error = error(-1);
+      Scalar new_error;
       for (const auto& a: extrema){
         //If this root is on [-1,1] then it's one of the oscillation positions
         if ((abs(a) < 1) and (abs(imag(a)) < n*1e-15)){
-          extreme_x[j] = real(a);
-          j+=1;
+          new_error = error(real(a));
+          //enforce sign oscillation
+          if (new_error*old_error < 0){
+            old_error = new_error;
+            extreme_x[j] = real(a);
+            j+=1;
+          }
         }
       }
-
-      //std::cout << extreme_x;
 
       //Sort the extreme values since they must oscillate
       std::sort(extreme_x.data(), extreme_x.data() + extreme_x.size());
@@ -135,6 +147,8 @@ struct Remez{
       Scalar y2 = (f(1) - p3.coeffs.sum())/L22;
 
       p2 = Poly(p3.coeffs - y2*p2.coeffs);
+
+      p2.error = abs(y2) + f_c.error;
 
       if (abs((last_error - y2)/y2) < 1e-8){break;}
 
