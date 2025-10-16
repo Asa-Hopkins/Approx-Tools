@@ -46,6 +46,11 @@ OTFFT::RealDCT& get_thread_local_dct(size_t n) {
 #endif
 #endif
 
+using Eigen::seq;
+
+//Eigen 3 complains this is deprecated but Eigen 5 removes the suggested alternative
+using Eigen::placeholders::last;
+
 //Spectra provides sparse matrix methods, but slows down compilation a lot
 #ifdef use_spectra
 #include <Spectra/SymEigsSolver.h>
@@ -121,9 +126,10 @@ public:
   using Complex = std::complex<Scalar>;
   using VectorC = Eigen::Matrix<Complex, Eigen::Dynamic, 1>;
   using Matrix2C = Eigen::Matrix<Complex, 2, 2>;
+  using Matrix = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
 
   Vector coeffs;
-  int degree;
+  unsigned int degree;
   Scalar error;
 
   // Constructor
@@ -191,9 +197,9 @@ public:
     return out;
   }
 
-//See "On Polynomial Multiplication in Chebyshev Basis"
-//By Pascal Giorgi (2010)
-//He provides C++ code that reduces chebyshev mult to two monomial mults
+  //See "On Polynomial Multiplication in Chebyshev Basis"
+  //By Pascal Giorgi (2010)
+  //He provides C++ code that reduces chebyshev mult to two monomial mults
   Chebyshev operator*(const Chebyshev &q) const {
     int new_degree = q.degree + degree;
     const int da = degree + 1;
@@ -206,7 +212,7 @@ public:
     Vector c = mono_mult(coeffs, q.coeffs);
 
     //I'm not sure why but the result of this convolution needs reversing
-    //I do this by swapping the inputs, since reversing both inputs reverses the output
+    //I do this by swapping the inputs
     Vector g = mono_mult(q.coeffs, coeffs, true);
 
     //When the two polynomials have different lengths we need to be careful
@@ -234,7 +240,7 @@ public:
     for (int i = 1; i < da; ++i) {
         c(i) -= coeffs(i) * q.coeffs(0);
     }
-
+    //Final term
     c(0) += g(da - 1) - coeffs(0) * q.coeffs(0) * 4;
     c(0) /= 2;
 
@@ -242,7 +248,7 @@ public:
 
   }
 
-  // Evaluate at a single point using Clenshaw algorithm
+  // Evaluate at a single point using the Clenshaw algorithm
   Scalar eval(Scalar x) const {
     int n = degree + 1;
     if (n <= 0) return Scalar(0);
@@ -266,10 +272,6 @@ public:
 
   // Evaluate on a vector of points
   // Naive way for now
-  Vector operator()(Vector x) const {
-    return eval(x);
-  }
-
   Vector eval(const Vector &xs) const {
     Vector ys(xs.size());
     for (int i = 0; i < xs.size(); ++i) {
@@ -278,7 +280,7 @@ public:
     return ys;
   }
 
-  // returns Chebyshev object for derivative
+  // returns derivative as Chebyshev object
   // Uses dT_n/dx = n*U_{n-1}, and U_n = 2*T_n + U_{n - 2}
   // So, essentially replace U_n with 2*T_n, and add to U_{n - 2} term
   Chebyshev deriv() const {
@@ -307,6 +309,7 @@ public:
     //therefore we directly form the quadratic with both roots when we encounter the one with imag(root)>0
 
     int n = roots.size();
+
     //Divide and conquer
     if (n > 6){return from_roots(roots.head(n/2), tol)*from_roots(roots.tail(n - n/2), tol);}
 
@@ -346,8 +349,28 @@ public:
     coeffs.conservativeResize(last+1);
   } 
 
+  void trunc_to_error(Scalar max_err = 1e-15, unsigned int extra = 0){
+    //Removes highest degrees up to given error tolerance
+    unsigned int n = degree;
+    while ((error + abs(coeffs[n]) < max_err) and n > 0){
+      error += abs(coeffs[n]);
+      n--;
+    }
+
+    //For RCF to work it needs some extra entries
+    extra = std::min(degree - n, extra);
+    while (extra > 0){
+      n++;
+      error -= abs(coeffs[n]);
+      extra--;
+    }
+
+    coeffs.conservativeResize(n+1);
+    degree = n;
+  } 
+
   // FFT-based Chebyshev fit for f: [-1,1] -> R functions
-  // Computes Chebyshev expansion (interpolant if truncate = false) of f(x) on [-1,1] to order n
+  // Computes Chebyshev expansion of f(x) on [-1,1] to order n
 
   // It's actually better (more accurate and more consistent timings) to calculate to a higher degree than requested and truncate
   // See chapter 4 of Approximation Theory and Approximation Practice (By Trefethen) for intro on aliasing issues and truncation
@@ -359,8 +382,9 @@ public:
   //https://dsp.stackexchange.com/questions/2807/fast-cosine-transform-via-fft
 
   //If OTFFT is available then we just use their DCT implementation directly
-  #ifdef use_otfft
-  static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n) {
+  //TODO - better error estimate for non-analytic functions
+
+  static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n, bool trunc = true) {
     if (n == 0) return Chebyshev();
 
     //Make sure there's some extra elements for error estimate
@@ -376,7 +400,13 @@ public:
     //The FFT is so fast that this is a significant part of runtime even for huge n
     //So we use the angle addition formulae to save on calls to std::cos
     const Scalar pi = std::acos(Scalar(-1));
-    const Scalar delta = pi / m;
+
+    #ifdef use_otfft
+      const Scalar delta = pi / m;
+    #else
+      const Scalar delta = (2.0*pi) / m;
+    #endif
+
     const Scalar c0 = std::cos(delta);
     const Scalar s0 = std::sin(delta);
 
@@ -387,109 +417,166 @@ public:
         Scalar x = c;
         vals[i] = f(x);
 
-        // update using recurrence
-        const Scalar c_next = c * c0 - s * s0;
-        const Scalar s_next = s * c0 + c * s0;
-        c = c_next;
-        s = s_next;
-
-        // correct every 16 iterations to mitigate drift in precision
-        if ((i & 15) == 0) {
-            Scalar theta = (Scalar(2*(i + 1) + 1) * pi) / Scalar(2*m);
-            c = std::cos(theta);
-            s = std::sin(theta);
+        if ((i & 15) != 0) {
+          // update using recurrence
+          const Scalar c_next = c * c0 - s * s0;
+          const Scalar s_next = s * c0 + c * s0;
+          c = c_next;
+          s = s_next;
+        }
+        else{
+           // correct every few iterations to mitigate drift in precision
+          #ifdef use_otfft
+            Scalar theta = (Scalar(2*i + 3) * pi) / Scalar(2*m);
+          #else
+           int k = 4*i + 5;
+           if (k > 2*m){k = 4*m - k;}
+           Scalar theta = (Scalar(k) * pi) / Scalar(2*m);
+          #endif
+          c = std::cos(theta);
+          s = std::sin(theta);
         }
     }
+    #ifdef use_otfft
+      OTFFT::double_vector cv = vals.data();
 
-    OTFFT::double_vector cv = vals.data();
-
-    #ifdef fft_cache
-    auto& fft = get_thread_local_dct(m);
-    fft.fwdn(cv);
+      #ifdef fft_cache
+        auto& fft = get_thread_local_dct(m);
+        fft.fwdn(cv);
+      #else
+        auto fft = OTFFT::createDCT(m);
+        fft->fwdn(cv);
+      #endif
+      vals *= 2;
     #else
-    auto fft = OTFFT::createDCT(m);
-    fft->fwdn(cv);
-    #endif
+      const Complex I(Scalar(0), Scalar(1));
+    
+      Eigen::FFT<Scalar> fft;
 
-    vals *= 2;
+      // Build array of f(cos(theta_k)) values, but shuffled a bit
+      // Normally theta_k = (2*k + 1)*pi/2/m
+      for (unsigned int i = 0; i < m; i++) {
+        int k = 4*i + 1;
+        if (k > 2*m){k = 4*m - k;}
+        Scalar theta = (Scalar(k) * pi) / Scalar(2*m);
+        vals[i] = f(std::cos(theta));
+      }
+
+      VectorC fft_out(m);
+      fft.fwd(fft_out, vals);
+
+      // Scale by 2*exp(i*pi*k/(2n))/m to get DCT from FFT
+      for (unsigned int k = 0; k < m; ++k) {
+        Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
+        Complex mult = std::exp(-I * angle) * (Scalar(2) / m);
+        Complex val = fft_out[k] * mult;
+        vals[k] = val.real();
+      }
+    #endif
     vals[0] /= Scalar(2);
 
-    Chebyshev output = Chebyshev(vals.head(n));
-    //Estimate error from extra components
+    if (not trunc){
+      return Chebyshev(vals);
+    }
 
+    Chebyshev output = Chebyshev(vals.head(n));
+
+    //Estimate error from extra components
+    //Doesn't work well for non-smooth functions
     output.error = vals.tail(extra).cwiseAbs().sum();
 
-    //Estimate decay rate as median of ratios between elements
-    //This doesn't work as intended currently
-    /*
-    Vector decays = vals.segment(n-1, extra-1).array() / vals.segment(n, extra - 1).array();
-
-    std::nth_element(decays.data(), decays.data() + (extra - 1) / 2, decays.data() + (extra - 1));
-
-    Scalar rho = decays[(extra - 1)/2];
-
-    output.error /= Scalar(1) - rho;
-    */
     return output;
   }
-  #else
-  static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n, bool truncate = true) {
-    if (n == 0) {
-      Vector zero(1);
-      zero << Scalar(0);
-      return Chebyshev(zero);
-    }
-
-    int m = n;
-
-    if (truncate){
-      m = next_power(n);
-    }
-
-    const Scalar pi = std::acos(Scalar(-1));
-    const Complex I(Scalar(0), Scalar(1));
-    
-    Eigen::FFT<Scalar> fft;
-
-    // Buffers for FFT input and output
-    Vector vals(m);
-    VectorC fft_out(m);
-
-    // Build array of f(cos(theta_k)) values, but shuffled a bit
-    // Normally theta_k = (2*k + 1)*pi/2/m
-    for (unsigned int i = 0; i < m; i++) {
-      int k = 4*i + 1;
-      if (k > 2*m) k = 4*m - k;
-      Scalar theta = (Scalar(k) * pi) / Scalar(2*m);
-      vals[i] = f(std::cos(theta));
-    }
-
-    fft.fwd(fft_out, vals);
-
-    // Scale by 2*exp(i*pi*k/(2n))/m and truncate to first n
-    Vector coeffs(n);
-    for (unsigned int k = 0; k < n; ++k) {
-      Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
-      Complex mult = std::exp(-I * angle) * (Scalar(2) / m);
-      Complex val = fft_out[k] * mult;
-      coeffs[k] = val.real();
-    }
-
-    coeffs[0] /= Scalar(2);
-    return Chebyshev(coeffs);
-  }
-  #endif
   
-  //Fit polynomial at arbitrary nodes
-  //O(n^2) method - set up Lagrange interpolant, evaluate at Chebyshev nodes
-  //then call the FFT fit above. 
+  static Chebyshev fit_bounded(std::function<Scalar(Scalar)> f, Scalar tolerance = 1e-16, unsigned int n = 16, unsigned int extra = 0) {
+    //We essentially keep doubling the number of interpolation points until we converge
+    //If user tolerance is too low then we hit precision issues first so that needs to be checked
+    Chebyshev output;
 
+    //Get machine epsilon
+    Scalar eps = std::numeric_limits<Scalar>::epsilon();
+
+    while (true){
+      output = Chebyshev::fit(f, n, false);
+      //We care about error relative to the max component for testing convergence
+      Scalar max_coeff = output.coeffs.cwiseAbs().maxCoeff();
+
+      //Guarantees on FFT accuracy in the infinity norm suck, which limits our ability to tell if a number is 0 or not
+      //see "Error Analysis of Some Operations Involved in the Cooley-Tukey Fast Fourier Transform"
+      //By Brisebarre et al.
+      Scalar scale = std::max(10*n*eps, 100*eps);
+      //If the last 5 values are effectively 0, we've converged
+      //Please don't pass in sin(T_6(x)) and expect it to work
+      if (scale*max_coeff > output.coeffs.tail(5).cwiseAbs().maxCoeff()){
+        break;
+      }
+      else {n*=2;}
+    }
+    
+    //Now truncate to user tolerance
+    output.error = 0;
+    output.trunc_to_error(tolerance, extra);
+
+    if (output.error == 0){
+      //If error is 0, we hit floating point limits before the user's tolerance
+      //This estimate is larger than the tolerance and lets the user know something went wrong
+      output.error = output.coeffs.tail(5).cwiseAbs().maxCoeff();
+    }
+    
+
+    return output;
+  }
+
+  //TODO Fit polynomial at arbitrary nodes
+  //O(n^2) method - set up Lagrange interpolant, evaluate at Chebyshev nodes
+  //then call the FFT fit above.
+
+  //TODO - fast multipoint evaluation. I believe this can be done with a non-uniform DCT (NUFFT)
+  //The inverse transform might be useful for interpolation at arbitrary nodes too
+  //With fast multipoint evaluation, the rootfinder can become O(NlogN) via fast subdivision
 
   //Finds roots of Chebyshev series polynomial
   //Constructs the "colleague matrix" which has our polynomial as its characteristic polynomial
   //Then exploits its nearly tridiagonal form to find eigenvalues with fast QR iterations
   //I implement the stable QR algorithm from Serkh and Rokhlin (2021)
   //Good convergence - around 2n iterations needed consistently
+  //TODO Use explicit vectorisation, it's slower than matlab's O(N^3) method
+
+  // ================= Root finder =================
+  VectorC roots() {
+    int d = degree;
+    if (d <= 0) return VectorC();
+
+    if (d == 1){
+      VectorC root(1);
+      root << -coeffs[0]/coeffs[1];
+      return root;
+    }
+
+    // nth unit vector
+    Vector e_n = Vector::Zero(d);
+    e_n[d-1] = 1;
+
+    // coeffs (normalised to monic)
+    Vector c = coeffs / coeffs[degree];
+    c = -c / Scalar(2);
+    c[0] *= std::sqrt(Scalar(2));
+
+    // superdiagonal
+    Vector a = Vector::Constant(d-1, Scalar(0.5));
+    a[0] *= std::sqrt(Scalar(2));
+
+    // diagonal
+    Vector diag = Vector::Zero(d);
+
+    return QR(
+      diag.template cast<Complex>(),
+      a.template cast<Complex>(),
+      e_n.template cast<Complex>(),
+      c.head(d).template cast<Complex>()
+    );
+
+  }
 
   // ================= Algorithm 2: Rotate =================
   static void
@@ -533,7 +620,8 @@ public:
       Complex s = b[k - 1] + p[k - 1]*std::conj(q[k]);
       Complex c = d[k]     + p[k]*std::conj(q[k]);
 
-      Scalar h = std::sqrt((c*std::conj(c) + s*std::conj(s)).real());
+      //I'm aware std::hypot exists but it's like 10x slower
+      Scalar h = std::sqrt(std::norm(c) + std::norm(s));
 
       Matrix2C Qk;
       if (h == 0) {
@@ -548,7 +636,7 @@ public:
         g[k-2] = Qk(0,0)*g[k-2] - Qk(0,1)*q2[k]*std::conj(p[k-2]);
       }
 
-      auto temp = Qk(0,0)*d[k-1] + Qk(0,1)*g[k-1];
+      Complex temp = Qk(0,0)*d[k-1] + Qk(0,1)*g[k-1];
       g[k-1] = Qk(1,0)*d[k-1] + Qk(1,1)*g[k-1];
       d[k-1] = temp;
 
@@ -559,6 +647,7 @@ public:
       temp = Qk(0,0)*p[k-1] + Qk(0,1)*p[k];
       p[k] = Qk(1,0)*p[k-1] + Qk(1,1)*p[k];
       p[k-1] = temp;
+
       if (std::norm(p[k-1]*std::conj(q[k])) +
       std::norm(p[k]*std::conj(q[k])) >
       std::norm(b[k-1]) + std::norm(d[k])) {
@@ -601,7 +690,7 @@ public:
         Complex mu = (std::abs(A(0,0) - mu1) < std::abs(A(0,0) - mu2)) ? mu1 : mu2;
 
         mu_sum += mu;
-        //double check this line
+
         d.tail(n - i).array() -= mu;
 
         //Perform a QR step
@@ -617,77 +706,68 @@ public:
     }
     return d + p.cwiseProduct(q.conjugate());
   }
+  //A 2x2 Rayleigh-Ritz step
+  static Vector eigen_est2(const Matrix& T, Vector& v1){
+    v1.normalize();
+    Eigen::VectorXd v2 = T * v1;
+    Eigen::VectorXd eigenvec = v1*0;
 
-  // ================= Root finder =================
-  VectorC roots() {
-    int d = degree;
-    if (d <= 0) return VectorC();
+    //If residual is small enough, skip refining as it harms accuracy
+    double eigenval = v1.dot(v2);
+    double residual = (v2 - eigenval * v1).squaredNorm();
+    if (residual < v1.size()*1e-25){return v2/eigenval;}
 
-    if (d == 1){
-      VectorC root(1);
-      root << -coeffs[0]/coeffs[1];
-      return root;
-    }
+    v2.normalize();
+    v1 -= v1.dot(v2) * v2;
+    v1.normalize();
+  
+    //Form matrix Q from v1 and v2, then R = Q.T @ T @ Q
+    //Then we find the top eigenvalue/vector of R with a stable quadratic formula
+    double a = v1.dot(T * v1);
+    double b = v1.dot(T * v2);
+    double c = v2.dot(T * v2);
 
-    // nth unit vector
-    Vector e_n = Vector::Zero(d);
-    e_n[d-1] = 1;
+    double delta = (c - a) / 2.0;
+    int sign = (delta > 0) ? 1 : -1;
+    //Get largest magnitude eigenvalue
+    eigenval = (a + c)/2.0 + sign * sqrt(delta*delta + b*b);
 
-    // coeffs (normalised to monic)
-    Vector c = coeffs / coeffs[degree];
-    c = -c / Scalar(2);
-    c[0] *= std::sqrt(Scalar(2));
-
-    // superdiagonal
-    Vector a = Vector::Constant(d-1, Scalar(0.5));
-    a[0] *= std::sqrt(Scalar(2));
-
-    // diagonal
-    Vector diag = Vector::Zero(d);
-
-    return QR(
-      diag.template cast<Complex>(),
-      a.template cast<Complex>(),
-      e_n.template cast<Complex>(),
-      c.head(d).template cast<Complex>()
-    );
-
+    //Get eigenvector of T
+    if (abs(b) > abs(eigenval - a)){eigenvec = (eigenval - c)*v1 + b*v2;}
+    else{eigenvec = b*v1 + (eigenval - a)*v2;}
+    return eigenvec.normalized();
   }
+
 
   //Uses the method from "Real Polynomial Chebyshev Approximation by the Carathéodory-Fejér Method"
   //By Gutknecht and Trefethen (1982)
-
   //The algorithm in the above paper is simpler than their 1983 one which covers rational approximation
-  static Chebyshev RCF(std::function<Scalar(Scalar)> f, unsigned int n, unsigned int N) {
-  //inputs: f is a function to be approximated on [-1,1]
-  //n is the returned polynomial degree
-  //N is the polynomial degree for calculations, the error of fit(f,N) should be negligible compared to fit(f,n)
+  static Chebyshev RCF_truncate(Chebyshev c, unsigned int n, bool no_edit = false) {
+  //Input is a Chebyshev series that needs to be truncated to degree n using the Carathéodory-Fejér Method
+  //Result is polynomial of degree n which is very, very near the best approximant to the original degree N one.
 
-  //Basic idea is to form a Hankel matrix from an extended Chebyshev series of the function
+  //Basic idea is to form a Hankel matrix from the Chebyshev coefficients between orders n and N
   //Then the largest eigenvalue estimates the approximation error and the eigenvector describes
   //a rational function for the error, called b(x)
   //We use the knowledge of that error to correct the Chebyshev series of order n
 
   //Some notes on optimisation
-  //The 1983 paper suggests multiple places where FFTs could be applied but I haven't implemented it yet
+  //The 1983 paper suggests multiple places where FFTs can be applied
   //They refer to "FAST FOURIER METHODS IN COMPUTATIONAL COMPLEX ANALYSIS" by Peter Henrici (1979)
 
   //The laurent series for the Blaskche product b(x) can be calculated via FFT, since it's the ratio
   //of two polynomials in the monomial basis, and multiplication/division is pointwise in fourier space.
+  //This isn't actually faster unless N-n is huge, plus the direct method has an early-exit condition
 
-  //Forming the polynomial q(x) which is p(x) but with the zeros inside the unit disc factored out
+  //For the rational case (not yet implemented), forming the polynomial q(x) which is 
+  //p(x) but with the zeros inside the unit disc factored out
   //can be done with an FFT method too, see section 3.2 of Peter's book
   //The algorithm there seems to give p(x)/q(x) and I haven't figured out a way to get q(x) directly
-
-  //I don't bother with those yet. For smooth cases, N - n will be small so just using direct methods is fine.
   
   //Something they don't mention is that mutliplication by a Hankel matrix can be done with an FFT too
   //This would make the fastest way to get the largest eigenvalue/vector a Lanczos iteration using these FFTs
-  //I have implemented this with Spectra
-    using Eigen::seq;
-
-    //Eigen 3 complains this is deprecated but Eigen 5 removes the suggested alternative
-    using Eigen::placeholders::last;
+    unsigned int N = c.degree;
+    if (N <= n  + 1){return c;}
 
     if (n == 0) {
       Vector zero(1);
@@ -695,33 +775,94 @@ public:
       return Chebyshev(zero);
     }
 
-    Chebyshev c = Chebyshev::fit(f, N+1);
-
     Vector u = Vector::Zero(N-n);
+    Scalar val;
 
-    //Crossover for dense solver vs sparse solver
+    //Crossover for dense solver vs sparse solver. I haven't checked with OTFFT
     #ifdef use_spectra
     if ((N - n) < 90){
     #endif
-      // construct Hankel matrix of size (N-n) x (N-n)
-      Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> H = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>::Zero(N - n, N - n);
 
-      //for (int i = 0; i < N-n; i++){
+      //We only need the top eigenvalue so it's faster to use power iteration than do a full solve
+      //Convergence rate is roughly equal to Chebyshev series convergence rate at T_n
+
+      //We have a guarantee that u_0 != 0 in the eigenvector from "Remarks on an Algebraic Problem" by Tagaki (1925)
+      //As such, the vector u = [1, 0, ..., 0] is a safer and often much better guess than random.
+      //H * u is then just the first column of H
+
+      Vector h = c.coeffs(seq(n+1,last));
+      u = h;
+ 
+      //Build Hankel matrix
+      Matrix H = Matrix::Zero(N - n, N - n);
+
       for (int i = 0; i < N-n; i++){
-        H(i,Eigen::seq(0,last - i)) = c.coeffs(seq(i+n+1,last));
+        H(i,seq(0,last - i)) = c.coeffs(seq(i+n+1,last));
       }
 
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>> es(H);
-      auto evals = es.eigenvalues();            // Should be ascending order but we do a full search anyway
-      auto evecs = es.eigenvectors();           // columns are eigenvectors
+      //Do a single step of Rayleigh-Ritz, roughly halves the iterations needed
+      //by eliminating second highest eigenvector's component
+      u = eigen_est2(H, u);
 
-      //We want argmax of abs(evals)
-      Eigen::Index idx;
-      (evals.array().abs()).maxCoeff(&idx);
+      int M = h.size();
+      Eigen::VectorXd y = Eigen::VectorXd::Zero(M);
+      Scalar res = 1;
+      Scalar oldres = 2;
+      //Get machine epsilon
+      Scalar eps = std::numeric_limits<Scalar>::epsilon();
 
-      Scalar val = evals(idx);
-      u = evecs.col(idx).transpose();
+      int iters = 0;
+
+      //We can multiply by a Hankel matrix in a matrix-free way
+      //It's as many FLOPs but seems around twice as fast due to better memory locality
+      while (abs(res - oldres) > 10*eps){
+        oldres = res;
+        for (int i = 0; i < M; ++i) {
+          int len = M - i;
+          y(i) = h.tail(len).dot(u.head(len));
+        }
+
+        for (int i = 0; i < M; ++i) {
+          int len = M - i;
+          u(i) = h.tail(len).dot(y.head(len));
+        }
+
+        u.normalize();
+        val = y.dot(u);
+        res = (u - y/val).norm();
+
+        //Max iterations
+        if (iters == (N - n)){
+          break;
+        }
+
+        iters++;
+      }
+      //Switch to safe method if above fails
+      if (abs(res) > 1000*eps){
+        Eigen::SelfAdjointEigenSolver<Matrix> es(H);
+        auto evals = es.eigenvalues();            // Should be ascending order but we do a full search anyway
+        auto evecs = es.eigenvectors();           // columns are eigenvectors
+
+        //We want argmax of abs(evals)
+        Eigen::Index idx;
+        (evals.array().abs()).maxCoeff(&idx);
+
+        val = evals(idx);
+        u = evecs.col(idx).transpose();
+      }
+/*
+    The eigenvalue is an extremely tight lower bound on the error between the n'th order CF approximation and N'th order Chebyshev series
+    The terms of |b_{-k}| could be summed to turn the lower bound on error into an upper bound
+    For n >> N - n they are effectively 0 as they drop off geometrically.
+    I multiply by 100 for now rather than estimating 1/(1-r) from the geometric series
+*/
       c.error += abs(val);
+      //Return error without modifying c
+      if (no_edit){
+        return c;
+      }
+
     #ifdef use_spectra
     }
     else{
@@ -734,29 +875,133 @@ public:
       u = evecs.col(0).transpose();
     }
     #endif
+/*
+    Let v(z) be the polynomial with u[1:]/u[0] as its coefficients
+    We want the Laurent series ("outside unit disc") of val * z^N * v(z)/v(z*)
+    Only need coefficients b_k for orders -n to n
 
-    //Let v(z) be the polynomial with u[1:]/u[0] as its coefficients
-    //We want the Laurent series (outside unit disc) of val * z^N * v(z)/v(z*)
-    //Only need coefficients b_k for orders -n to n
-
-    //We essentially use the long division algorithm to get this iterative formula
-    //b_k = c_k for n+1 <= k <= N
-    //Then the others are given by b_k = -1/u_1 ( b_{k+1} * u_2 + b_{k+1} * u_3 + ... + b_{k+M-m-1} * u_{M-m))
+    We essentially use the long division algorithm to get this iterative formula
+    b_k = c_k for n+1 <= k <= N
+    Then the others are given by b_k = -1/u_0 ( b_{k+1} * u_1 + b_{k+2} * u_2 + ... + b_{k+M-m-1} * u_{M-m-1})
+*/
     Vector b = Vector::Zero(n + N + 1);
-
     b(seq(2*n + 1, last)) = c.coeffs(seq(n + 1, last));
+    //Each iteration is effectively multiplication by a companion matrix
+    //We know every root is below 1 from the theory so the terms must decay (eventually) and we can safely exit early
 
     for (int k = n; k + n + 1 > 0; k--){
       int i = k + n;
 
       b[i] = -1/u[0] * b(seq(i+1,i+N-n-1)).dot(u(seq(1,last)));
 
+      if (not (i&15)){
+        //When norm is negligible, we exit
+        if (b(seq(i+1,i+N-n-1)).norm() < c.error*1e-16){break;}
+      }
+
       //Correct the Chebyshev series with laurent series
       c.coeffs[abs(k)] -= b[i];
     }
+    c.error += 100*abs(b(seq(0,N-n-2)).dot(u(seq(1,last)))/u[0] );
     
     c.coeffs.conservativeResize(n+1);
     c.degree = n;
+    return c;
+  }
+
+  static Chebyshev RCF(std::function<Scalar(Scalar)> f, unsigned int n, unsigned int N) {
+  //inputs: f is a function to be approximated on [-1,1]
+  //n is the returned polynomial degree
+  //N is the polynomial degree for calculations, the error of fit(f,N+1) should be negligible compared to fit(f,n+1)
+    Chebyshev c = Chebyshev::fit(f, N+1);
+    return Chebyshev::RCF_truncate(c, n);
+  }
+
+  static Chebyshev RCF_bounded_truncate(Chebyshev c, Scalar tolerance) {
+  //inputs: f is a function to be approximated on [-1,1]
+  //tol is the maximum error that the user will allow on the approximation
+
+    //Start with Chebyshev series that approximates f closer than the desired tolerance
+    unsigned int N = c.degree + 1;
+
+    if (N <= 2) return c;
+
+    //Now we need to choose the degree to truncate to
+    //It's possible to bound the largest eigenvalue of the Hankel matrix that appears
+    //We find the lowest degree which is guaranteed to have error too large and binary search
+    //The RCF method breaks if N-n < 2
+
+    //Lower limit is largest unacceptable degree
+    //Upper limit is smallest acceptable degree
+    unsigned int upper_limit = N-2;
+    unsigned int lower_limit = N-2;
+    Scalar upper_bound = 1e99;
+    Scalar lower_bound = 0;
+    Scalar error = c.error;
+
+    while (lower_bound < tolerance){
+      lower_limit--;
+      if (lower_limit == -1){return Chebyshev();}
+      unsigned int n = N - lower_limit - 1;
+      //For a lower bound, take a normalised test vector x and find x.dot(H*x) where H is the Hankel matrix
+      //Taking x to be the first row of the Hankel matrix works very well
+      Vector h = c.coeffs.tail(n);
+      //We skip building the Hankel matrix explicitly
+      Vector x = h;
+      Vector y(n);
+      for (int i = 0; i < n; ++i) {
+        int len = n - i;
+        y(i) = h.tail(len).dot(x.head(len));
+      }
+      lower_bound = abs(x.dot(y)/x.squaredNorm());
+      
+      //For upper bound, use matrix 1-norm
+      upper_bound = h.cwiseAbs().sum();
+      if (upper_bound < tolerance){
+        upper_limit = lower_limit;
+      }
+    }
+    while (upper_limit - lower_limit > 1){
+      unsigned int mid = (upper_limit + lower_limit)/2;
+      c = Chebyshev::RCF_truncate(c, mid, true);
+      if (c.error > tolerance){
+        lower_limit = mid;
+      } else {
+        upper_limit = mid;
+      }
+      c.error = error;
+    }
+
+    return Chebyshev::RCF_truncate(c, upper_limit);
+  }
+
+  static Chebyshev RCF_bounded(std::function<Scalar(Scalar)> f, Scalar tolerance, unsigned int initial_n = 16) {
+  //inputs: f is a function to be approximated on [-1,1]
+  //n is the returned polynomial degree
+  //N is the polynomial degree for calculations, the error of fit(f,N+1) should be negligible compared to fit(f,n+1)
+    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(1000), initial_n, 2);
+    return Chebyshev::RCF_bounded_truncate(c, tolerance);
+  }
+
+  static Chebyshev RCF_odd_even(std::function<Scalar(Scalar)> f, Scalar tolerance, unsigned int initial_n = 16) {
+  //Take the input function as the sum of an odd function and an even function, and find the best approximant for each simultaneously
+    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(2000), initial_n, 4);
+
+    Chebyshev odd = Chebyshev(c.coeffs(seq(1,last,2)));
+    Chebyshev even = Chebyshev(c.coeffs(seq(0,last,2)));
+    odd.error = c.error;
+    even.error = c.error;
+    odd.trunc_to_error(tolerance/Scalar(1000), 2);
+    even.trunc_to_error(tolerance/Scalar(1000), 2);
+    
+    odd = Chebyshev::RCF_bounded_truncate(odd, tolerance);
+    even = Chebyshev::RCF_bounded_truncate(even, tolerance);
+
+    c.coeffs(seq(1,2*odd.degree+1,2)) = odd.coeffs;
+    c.coeffs(seq(0,2*even.degree,2)) = even.coeffs;
+    c.error = std::max(even.error, odd.error);
+    c.degree = std::max(2*even.degree, 2*odd.degree+1);
+    c.coeffs.conservativeResize(c.degree + 1);
     return c;
   }
 
