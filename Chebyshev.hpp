@@ -3,7 +3,7 @@
 #ifdef use_otfft
 #include <otfftpp/otfft.h>
 #endif
-
+#include "pocketfft_hdronly.h"
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/FFT>
 
@@ -384,8 +384,42 @@ public:
   //If OTFFT is available then we just use their DCT implementation directly
   //TODO - better error estimate for non-analytic functions
 
+
+static void fftEigenPocketFFT(VectorC& out,
+                       const Vector& in)
+{
+    using Complex = std::complex<Scalar>;
+    const ssize_t n = in.size();
+
+    // Prepare input in complex form
+    Eigen::Matrix<Complex, Eigen::Dynamic, 1> tmp(n);
+    for (ssize_t i = 0; i < n; ++i)
+        tmp[i] = Complex(in[i], Scalar(0));
+
+    // Define PocketFFT parameters
+    pocketfft::shape_t shape = { (size_t)n };
+    pocketfft::stride_t stride_in = { sizeof(Complex) };
+    pocketfft::stride_t stride_out = { sizeof(Complex) };
+    pocketfft::shape_t axes = { 0 };
+
+    // Run forward FFT (modern PocketFFT API)
+    pocketfft::c2c<Scalar>(
+        shape,
+        stride_in,
+        stride_out,
+        axes,
+        /*forward=*/true,
+        tmp.data(),     // input
+        tmp.data(),     // output (in-place)
+        (Scalar)1.0     // scaling factor
+    );
+
+    out = tmp;
+}
+
   static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n, bool trunc = true) {
     if (n == 0) return Chebyshev();
+
 
     //Make sure there's some extra elements for error estimate
     unsigned int m = n + 10;
@@ -451,7 +485,7 @@ public:
     #else
       const Complex I(Scalar(0), Scalar(1));
     
-      Eigen::FFT<Scalar> fft;
+      //Eigen::FFT<Scalar> fft;
 
       // Build array of f(cos(theta_k)) values, but shuffled a bit
       // Normally theta_k = (2*k + 1)*pi/2/m
@@ -463,8 +497,8 @@ public:
       }
 
       VectorC fft_out(m);
-      fft.fwd(fft_out, vals);
-
+      //fft.fwd(fft_out, vals);
+      fftEigenPocketFFT(fft_out, vals);
       // Scale by 2*exp(i*pi*k/(2n))/m to get DCT from FFT
       for (unsigned int k = 0; k < m; ++k) {
         Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
@@ -496,6 +530,9 @@ public:
     //Get machine epsilon
     Scalar eps = std::numeric_limits<Scalar>::epsilon();
 
+    Scalar tail_coeff = 1e99;
+    Scalar oldtail_coeff = 1e99;
+
     while (true){
       output = Chebyshev::fit(f, n, false);
       //We care about error relative to the max component for testing convergence
@@ -507,12 +544,14 @@ public:
       Scalar scale = std::max(10*n*eps, 100*eps);
       //If the last 5 values are effectively 0, we've converged
       //Please don't pass in sin(T_6(x)) and expect it to work
-      if (scale*max_coeff > output.coeffs.tail(5).cwiseAbs().maxCoeff()){
+      tail_coeff = output.coeffs.tail(5).cwiseAbs().maxCoeff();
+      if ((scale*max_coeff > tail_coeff) or ((oldtail_coeff/tail_coeff < 10) and (tail_coeff < 1e-6*max_coeff))){
         break;
       }
       else {n*=2;}
+      oldtail_coeff = tail_coeff;
     }
-    
+
     //Now truncate to user tolerance
     output.error = 0;
     output.trunc_to_error(tolerance, extra);
@@ -709,12 +748,12 @@ public:
   //A 2x2 Rayleigh-Ritz step
   static Vector eigen_est2(const Matrix& T, Vector& v1){
     v1.normalize();
-    Eigen::VectorXd v2 = T * v1;
-    Eigen::VectorXd eigenvec = v1*0;
+    Vector v2 = T * v1;
+    Vector eigenvec = v1*0;
 
     //If residual is small enough, skip refining as it harms accuracy
-    double eigenval = v1.dot(v2);
-    double residual = (v2 - eigenval * v1).squaredNorm();
+    Scalar eigenval = v1.dot(v2);
+    Scalar residual = (v2 - eigenval * v1).squaredNorm();
     if (residual < v1.size()*1e-25){return v2/eigenval;}
 
     v2.normalize();
@@ -723,11 +762,11 @@ public:
   
     //Form matrix Q from v1 and v2, then R = Q.T @ T @ Q
     //Then we find the top eigenvalue/vector of R with a stable quadratic formula
-    double a = v1.dot(T * v1);
-    double b = v1.dot(T * v2);
-    double c = v2.dot(T * v2);
+    Scalar a = v1.dot(T * v1);
+    Scalar b = v1.dot(T * v2);
+    Scalar c = v2.dot(T * v2);
 
-    double delta = (c - a) / 2.0;
+    Scalar delta = (c - a) / 2.0;
     int sign = (delta > 0) ? 1 : -1;
     //Get largest magnitude eigenvalue
     eigenval = (a + c)/2.0 + sign * sqrt(delta*delta + b*b);
@@ -805,7 +844,7 @@ public:
       u = eigen_est2(H, u);
 
       int M = h.size();
-      Eigen::VectorXd y = Eigen::VectorXd::Zero(M);
+      Vector y = Vector::Zero(M);
       Scalar res = 1;
       Scalar oldres = 2;
       //Get machine epsilon
@@ -857,11 +896,6 @@ public:
     For n >> N - n they are effectively 0 as they drop off geometrically.
     I multiply by 100 for now rather than estimating 1/(1-r) from the geometric series
 */
-      c.error += abs(val);
-      //Return error without modifying c
-      if (no_edit){
-        return c;
-      }
 
     #ifdef use_spectra
     }
@@ -873,8 +907,18 @@ public:
       int nconv = eigs.compute(Spectra::SortRule::LargestMagn);
       auto evecs = eigs.eigenvectors();
       u = evecs.col(0).transpose();
+      auto evals = eigs.eigenvalues();
+      val = evals[0]; 
     }
     #endif
+
+    c.error += abs(val);
+
+    //Return error without modifying c.coeffs
+    if (no_edit){
+      return c;
+    }
+
 /*
     Let v(z) be the polynomial with u[1:]/u[0] as its coefficients
     We want the Laurent series ("outside unit disc") of val * z^N * v(z)/v(z*)
@@ -923,7 +967,6 @@ public:
 
     //Start with Chebyshev series that approximates f closer than the desired tolerance
     unsigned int N = c.degree + 1;
-
     if (N <= 2) return c;
 
     //Now we need to choose the degree to truncate to
@@ -946,6 +989,7 @@ public:
       //For a lower bound, take a normalised test vector x and find x.dot(H*x) where H is the Hankel matrix
       //Taking x to be the first row of the Hankel matrix works very well
       Vector h = c.coeffs.tail(n);
+/*
       //We skip building the Hankel matrix explicitly
       Vector x = h;
       Vector y(n);
@@ -954,6 +998,8 @@ public:
         y(i) = h.tail(len).dot(x.head(len));
       }
       lower_bound = abs(x.dot(y)/x.squaredNorm());
+*/
+      lower_bound = h.cwiseAbs().maxCoeff();
       
       //For upper bound, use matrix 1-norm
       upper_bound = h.cwiseAbs().sum();
@@ -979,21 +1025,20 @@ public:
   //inputs: f is a function to be approximated on [-1,1]
   //n is the returned polynomial degree
   //N is the polynomial degree for calculations, the error of fit(f,N+1) should be negligible compared to fit(f,n+1)
-    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(1000), initial_n, 2);
+    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(100), initial_n, 2);
     return Chebyshev::RCF_bounded_truncate(c, tolerance);
   }
 
   static Chebyshev RCF_odd_even(std::function<Scalar(Scalar)> f, Scalar tolerance, unsigned int initial_n = 16) {
   //Take the input function as the sum of an odd function and an even function, and find the best approximant for each simultaneously
-    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(2000), initial_n, 4);
+    Chebyshev c = Chebyshev::fit_bounded(f, tolerance/Scalar(200), initial_n, 4);
 
     Chebyshev odd = Chebyshev(c.coeffs(seq(1,last,2)));
     Chebyshev even = Chebyshev(c.coeffs(seq(0,last,2)));
     odd.error = c.error;
     even.error = c.error;
-    odd.trunc_to_error(tolerance/Scalar(1000), 2);
-    even.trunc_to_error(tolerance/Scalar(1000), 2);
-    
+    odd.trunc_to_error(tolerance/Scalar(100), 2);
+    even.trunc_to_error(tolerance/Scalar(100), 2);
     odd = Chebyshev::RCF_bounded_truncate(odd, tolerance);
     even = Chebyshev::RCF_bounded_truncate(even, tolerance);
 
