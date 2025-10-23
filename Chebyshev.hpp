@@ -808,12 +808,6 @@ static void fftEigenPocketFFT(VectorC& out,
     unsigned int N = c.degree;
     if (N <= n  + 1){return c;}
 
-    if (n == 0) {
-      Vector zero(1);
-      zero << Scalar(0);
-      return Chebyshev(zero);
-    }
-
     Vector u = Vector::Zero(N-n);
     Scalar val;
 
@@ -932,19 +926,19 @@ static void fftEigenPocketFFT(VectorC& out,
     b(seq(2*n + 1, last)) = c.coeffs(seq(n + 1, last));
     //Each iteration is effectively multiplication by a companion matrix
     //We know every root is below 1 from the theory so the terms must decay (eventually) and we can safely exit early
-
     for (int k = n; k + n + 1 > 0; k--){
       int i = k + n;
 
       b[i] = -1/u[0] * b(seq(i+1,i+N-n-1)).dot(u(seq(1,last)));
+
+      //Correct the Chebyshev series with laurent series
+      c.coeffs[abs(k)] -= b[i];
 
       if (not (i&15)){
         //When norm is negligible, we exit
         if (b(seq(i+1,i+N-n-1)).norm() < c.error*1e-16){break;}
       }
 
-      //Correct the Chebyshev series with laurent series
-      c.coeffs[abs(k)] -= b[i];
     }
     c.error += 100*abs(b(seq(0,N-n-2)).dot(u(seq(1,last)))/u[0] );
     
@@ -984,21 +978,11 @@ static void fftEigenPocketFFT(VectorC& out,
 
     while (lower_bound < tolerance){
       lower_limit--;
-      if (lower_limit == -1){return Chebyshev();}
+      if (lower_limit == -1){Chebyshev::RCF_truncate(c, 0);}
       unsigned int n = N - lower_limit - 1;
       //For a lower bound, take a normalised test vector x and find x.dot(H*x) where H is the Hankel matrix
       //Taking x to be the first row of the Hankel matrix works very well
       Vector h = c.coeffs.tail(n);
-/*
-      //We skip building the Hankel matrix explicitly
-      Vector x = h;
-      Vector y(n);
-      for (int i = 0; i < n; ++i) {
-        int len = n - i;
-        y(i) = h.tail(len).dot(x.head(len));
-      }
-      lower_bound = abs(x.dot(y)/x.squaredNorm());
-*/
       lower_bound = h.cwiseAbs().maxCoeff();
       
       //For upper bound, use matrix 1-norm
@@ -1017,7 +1001,6 @@ static void fftEigenPocketFFT(VectorC& out,
       }
       c.error = error;
     }
-
     return Chebyshev::RCF_truncate(c, upper_limit);
   }
 
@@ -1039,6 +1022,7 @@ static void fftEigenPocketFFT(VectorC& out,
     even.error = c.error;
     odd.trunc_to_error(tolerance/Scalar(100), 2);
     even.trunc_to_error(tolerance/Scalar(100), 2);
+
     odd = Chebyshev::RCF_bounded_truncate(odd, tolerance);
     even = Chebyshev::RCF_bounded_truncate(even, tolerance);
 
