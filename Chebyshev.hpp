@@ -3,7 +3,6 @@
 #ifdef use_otfft
 #include <otfftpp/otfft.h>
 #endif
-#include "pocketfft_hdronly.h"
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/FFT>
 
@@ -384,39 +383,6 @@ public:
   //If OTFFT is available then we just use their DCT implementation directly
   //TODO - better error estimate for non-analytic functions
 
-
-static void fftEigenPocketFFT(VectorC& out,
-                       const Vector& in)
-{
-    using Complex = std::complex<Scalar>;
-    const ssize_t n = in.size();
-
-    // Prepare input in complex form
-    Eigen::Matrix<Complex, Eigen::Dynamic, 1> tmp(n);
-    for (ssize_t i = 0; i < n; ++i)
-        tmp[i] = Complex(in[i], Scalar(0));
-
-    // Define PocketFFT parameters
-    pocketfft::shape_t shape = { (size_t)n };
-    pocketfft::stride_t stride_in = { sizeof(Complex) };
-    pocketfft::stride_t stride_out = { sizeof(Complex) };
-    pocketfft::shape_t axes = { 0 };
-
-    // Run forward FFT (modern PocketFFT API)
-    pocketfft::c2c<Scalar>(
-        shape,
-        stride_in,
-        stride_out,
-        axes,
-        /*forward=*/true,
-        tmp.data(),     // input
-        tmp.data(),     // output (in-place)
-        (Scalar)1.0     // scaling factor
-    );
-
-    out = tmp;
-}
-
   static Chebyshev fit(std::function<Scalar(Scalar)> f, unsigned int n, bool trunc = true) {
     if (n == 0) return Chebyshev();
 
@@ -485,7 +451,7 @@ static void fftEigenPocketFFT(VectorC& out,
     #else
       const Complex I(Scalar(0), Scalar(1));
     
-      //Eigen::FFT<Scalar> fft;
+      Eigen::FFT<Scalar> fft;
 
       // Build array of f(cos(theta_k)) values, but shuffled a bit
       // Normally theta_k = (2*k + 1)*pi/2/m
@@ -497,8 +463,7 @@ static void fftEigenPocketFFT(VectorC& out,
       }
 
       VectorC fft_out(m);
-      //fft.fwd(fft_out, vals);
-      fftEigenPocketFFT(fft_out, vals);
+      fft.fwd(fft_out, vals);
       // Scale by 2*exp(i*pi*k/(2n))/m to get DCT from FFT
       for (unsigned int k = 0; k < m; ++k) {
         Scalar angle = (pi * Scalar(k)) / Scalar(2*m);
